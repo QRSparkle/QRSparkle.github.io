@@ -106,17 +106,7 @@ input[type=text]{width:100%}
     <div class="ctl hide" id="sCtl">
       <label style="margin-top:0">ファイル名(転送開始前に変更できます)</label>
       <input type="text" id="fname" autocomplete="off">
-      <div class="row">
-        <button class="btn" id="bpause" type="button">⏸ 一時停止</button>
-        <button class="btn ghost" id="bprev" type="button" aria-label="前のQR">◀</button>
-        <button class="btn ghost" id="bnext" type="button" aria-label="次のQR">▶</button>
-        <button class="btn ghost" id="brestart" type="button">↻ 最初から</button>
-        <button class="btn ghost" id="bstop" type="button">⏹ 送信を中止</button>
-      </div>
-      <label>不足分だけ再表示(受信側の「未取得」の番号を入力)</label>
-      <div class="row" style="margin-top:4px"><input type="text" id="resend" placeholder="例: 3, 7, 12-15" autocomplete="off"><button class="btn ghost" id="bresend" type="button">再表示</button><button class="btn ghost" id="ball" type="button">全部に戻す</button></div>
       <div id="sSpeed" class="note" style="margin-top:12px"></div>
-      <div id="sFp" class="note bold"></div>
       <details class="set" id="fbWrap" style="margin-top:12px"><summary>📷 相手の読み取り状況に合わせる(実験的)</summary>
         <div class="note" style="margin-top:8px">受信側に表示される「状況コード」を、この端末のカメラで読み取るか手入力すると、表示速度や1枚あたりのデータ量を自動で調整します。カメラで読み取る場合は、受信側デバイスの状況コードをこの画面に向けてください。</div>
         <div class="row"><button class="btn ghost" id="bfbcam" type="button">📷 状況コードを読み取る</button></div>

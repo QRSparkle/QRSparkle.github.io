@@ -455,7 +455,6 @@
       x: await sha256Hex(raw),
       head: null
     };
-    $("#sFp").textContent = "照合コード: " + shortCode(sendFile.x || crc32Hex(sendFile.k)) + "(受信完了後の表示と一致するか確認できます)";
     rebuildHead();
     newSid();
     // マニフェスト枠(複数ファイル時のみ・新しいセッションIDで作り直す)
@@ -537,7 +536,6 @@
     rafSkip = 99;
     qrGenPending = qrDropCount = 0;
     fbNote = sendAuto ? fbNote : "";
-    $("#bpause").textContent = "⏸ 一時停止";
     $("#qrbox").classList.remove("hide");
     $("#sCtl").classList.remove("hide");
     prefetchQr();
@@ -612,18 +610,16 @@
 
   // --- ① 送信側の速度表示(既存の理論値表示) ---
   function updateSpeedLine() {
-    $("#sSpeed").textContent = "現在 " + fpsCurrent + "枚/秒 ・ 理論速度 約" + fmtBytes(fpsCurrent * chunkSize) + "/秒 ・ 全" + totalFrames + "枚 ≈ " + Math.ceil(totalFrames / Math.max(fpsCurrent, 1)) + "秒/周" + (fbNote ? " ・ " + fbNote : "");
+    $("#sSpeed").textContent = fbNote || "";
   }
   function updateFrameInfo() {
     const n = playOrder.length;
     const cur = playOrder[(playPos - 1 + n) % n] + 1;
-    $("#sInfo").textContent = cur + " / " + totalFrames + " 枚目 ・ " + (cycles + (playPos === 0 ? 0 : 1) || 1) + "周目" + (n < totalFrames ? " ・ 再送" + n + "枚のみ" : "") + ("(合計 " + fmtBytes(payloadLen()) + ")");
+    $("#sInfo").textContent = cur + " / " + totalFrames + " 枚目(合計 " + fmtBytes(payloadLen()) + ")";
   }
   function senderShowStatus() {
     if (!sendFile) return;
-    if (aborted) setStatus("#sSt", "warn", "一時停止中", "「▶ 再開」で続きから表示します");
-    else if (playOrder.length < totalFrames) setStatus("#sSt", "run", "再送中", "指定の" + playOrder.length + "枚だけを繰り返し表示しています");
-    else setStatus("#sSt", "run", "送信中", "受信側のカメラをこの画面に向けて、そのままお待ちください");
+    setStatus("#sSt", "run", "送信中", "受信側のカメラをこの画面に向けて、そのままお待ちください");
   }
 
   function renderLoop(t) {
@@ -699,19 +695,6 @@
   }
   let autoStable = 0;
 
-  function setPaused(p) {
-    aborted = p;
-    $("#bpause").textContent = p ? "▶ 再開" : "⏸ 一時停止";
-    if (!p) rafSkip = 99;
-    senderShowStatus();
-  }
-  function stepFrame(dir) {
-    if (!sendFile) return;
-    setPaused(true);
-    const n = playOrder.length;
-    playPos = ((playPos - 1 + dir) % n + n) % n;
-    pauseRendering = true;
-  }
   function stopSender(keepFiles) {
     sendFile = null;
     playOrder = [];
@@ -726,8 +709,6 @@
     $("#sCtl").classList.add("hide");
     $("#sInfo").textContent = "";
     $("#sSpeed").textContent = "";
-    $("#sFp").textContent = "";
-    $("#resend").value = "";
     fbFpsApplied = false;
     fbNote = "";
     $("#fbInfo").textContent = "";
@@ -738,41 +719,6 @@
     }
   }
 
-  $("#bpause").onclick = () => setPaused(!aborted);
-  $("#bprev").onclick = () => stepFrame(-1);
-  $("#bnext").onclick = () => stepFrame(1);
-  $("#brestart").onclick = () => {
-    if (!sendFile) return;
-    playOrder = [...Array(totalFrames).keys()];
-    playPos = 0;
-    cycles = 0;
-    $("#resend").value = "";
-    setPaused(false);
-    prefetchQr();
-  };
-  $("#bstop").onclick = () => stopSender(false);
-  $("#bresend").onclick = () => {
-    const list = parseRanges($("#resend").value, totalFrames);
-    if (!list.length) {
-      $("#sNote").textContent = "1〜" + totalFrames + "の番号を「3, 7, 12-15」のように入力してください";
-      return;
-    }
-    playOrder = list;
-    playPos = 0;
-    cycles = 0;
-    setPaused(false);
-    prefetchQr();
-    senderShowStatus();
-  };
-  $("#ball").onclick = () => {
-    if (!sendFile) return;
-    playOrder = [...Array(totalFrames).keys()];
-    playPos = 0;
-    cycles = 0;
-    $("#resend").value = "";
-    prefetchQr();
-    senderShowStatus();
-  };
   let nameTimer = 0;
   $("#fname").oninput = () => {
     if (!sendFile) return;
