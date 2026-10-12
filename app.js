@@ -1,9 +1,11 @@
 /* QR転送 app.js — 機能追加版
-   追加機能: ①転送速度・残り時間の表示(スライディングウィンドウ)
-            ②相手の読み取り状況に応じた自動調整(状況コードQR/手入力)
-            ③転送前のファイル一覧(送信側で確認→マニフェスト枠を先頭に送信)
-   プロトコル: 互換枠 "Q1|sid|idx|total|base64" + 新設マニフェスト枠 "QM|sid|base64(json)"
-               受信側の状況コード "FB1|sid|got|total|recfps"(新設・旧受信側は無視される方向で送信側のみが使う) */
+   ・転送速度/残り時間の表示 ・相手の読み取り状況に応じた自動調整 ・転送前のファイル一覧
+   ・欠損QRの自動復元(元データ→復元用枠の連続送信、受信側でガウス消去)
+   ・データ量の適応型分割 ・受信セッションの保存/再開(IndexedDB) ・読み取り品質の自動診断
+   プロトコル: 元データ枠 "Q1|sid|idx|total|b64"
+               復元用枠   "Q2|sid|total|ri|payloadLen|b64"
+               マニフェスト枠 "QM|sid|b64(json)"
+               状況コード "FB2|sid|got|total|recfps|recChunk"(旧 "FB1|sid|got|total|recfps" も受理) */
 (function () {
   'use strict';
 
@@ -83,6 +85,147 @@
   const b64enc = (u8) => btoa(String.fromCharCode.apply(null, u8));
   const b64dec = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
   /*PURE-END*/
+
+/*REC-START*/
+  // ---------- 欠損QRの自動復元(GF(2)上のランダム線形符号) ----------
+  // 元データ(K枚)を512枚ずつの「世代」に分け、世代ごとに復元用枠(=その世代の元データのランダムな部分集合のXOR和)を作る。
+  // 受信側は既知の枠を除いた方程式をオンラインのガウス消去で解く。
+  const GEN = 512;
+  const xorInto = (dst, src) => {
+    const n = Math.min(dst.length, src.length);
+    for (let i = 0; i < n; i++) dst[i] ^= src[i];
+  };
+  function repairMask(seed, g, n) {
+    const words = (n + 31) >>> 5;
+    const m = new Uint32Array(words);
+    let a = (Math.imul(seed + 1, 0x9e3779b1) ^ Math.imul(g + 7, 0x85ebca6b) ^ 0x1234abcd) | 0;
+    for (let i = -3; i < words; i++) {
+      a = (a + 0x6D2B79F5) | 0;
+      let t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      if (i >= 0) m[i] = (t ^ t >>> 14) >>> 0;
+    }
+    const rem = n & 31;
+    if (rem) m[words - 1] &= (1 << rem) - 1;
+    let any = 0;
+    for (let i = 0; i < words; i++) any |= m[i];
+    if (!any) { const b = seed % n; m[b >>> 5] |= 1 << (b & 31); }
+    return m;
+  }
+  // 世代の分け方: 枚数をほぼ均等に(最後だけ極端に小さくならないように)
+  function genLayout(total) {
+    const ng = Math.ceil(total / GEN), out = [];
+    for (let g = 0; g < ng; g++) {
+      const b = Math.floor(g * total / ng);
+      out.push({ base: b, n: Math.floor((g + 1) * total / ng) - b });
+    }
+    return out;
+  }
+  // 復元用枠 ri の中身(C バイト)を作る。full = ヘッダ+本体(送信するデータ全体)
+  function buildRepair(full, C, total, ri) {
+    const lay = genLayout(total), g = ri % lay.length, base = lay[g].base, n = lay[g].n;
+    const m = repairMask(ri, g, n), out = new Uint8Array(C);
+    for (let j = 0; j < n; j++) {
+      if (m[j >>> 5] >>> (j & 31) & 1) {
+        const a = (base + j) * C, end = Math.min(a + C, full.length);
+        for (let i = a, o = 0; i < end; i++, o++) out[o] ^= full[i];
+      }
+    }
+    return out;
+  }
+  function makeRecovery(total, onKnown) {
+    const frames = new Array(total);
+    const gens = [];
+    const genOf = new Uint16Array(total);
+    genLayout(total).forEach((l, g) => {
+      gens.push({ base: l.base, n: l.n, known: 0, rank: 0, piv: new Array(l.n).fill(null) });
+      genOf.fill(g, l.base, l.base + l.n);
+    });
+    let known = 0;
+    const lowBit = (m) => {
+      for (let w = 0; w < m.length; w++) {
+        const x = m[w] | 0;
+        if (x) return (w << 5) + 31 - Math.clz32(x & -x);
+      }
+      return -1;
+    };
+    const setKnown = (idx, data) => {
+      frames[idx] = data;
+      known++;
+      gens[genOf[idx]].known++;
+      if (onKnown) onKnown(idx);
+    };
+    // 方程式を追加。新しい情報なら true
+    const insert = (gen, row) => {
+      for (;;) {
+        const c = lowBit(row.m);
+        if (c < 0) return false;
+        const p = gen.piv[c];
+        if (!p) { gen.piv[c] = row; gen.rank++; return true; }
+        for (let w = 0; w < row.m.length; w++) row.m[w] ^= p.m[w];
+        xorInto(row.d, p.d);
+      }
+    };
+    // 新しく判明した枠 j を既存の方程式から取り除く
+    const stripKnown = (gen, j, data) => {
+      const w = j >>> 5, bit = 1 << (j & 31), redo = [];
+      for (let c = 0; c <= j; c++) {
+        const r = gen.piv[c];
+        if (r && (r.m[w] & bit)) {
+          xorInto(r.d, data);
+          r.m[w] &= ~bit;
+          if (c === j) { gen.piv[c] = null; gen.rank--; redo.push(r); }
+        }
+      }
+      for (const r of redo) insert(gen, r);
+    };
+    // 未知数 = 方程式の数(フルランク)になったら後退代入で全部解く
+    const solve = (gen) => {
+      const unknown = gen.n - gen.known;
+      if (unknown <= 0 || gen.rank < unknown) return;
+      for (let c = gen.n - 1; c >= 0; c--) {
+        const r = gen.piv[c];
+        if (!r) continue;
+        for (let j = c + 1; j < gen.n; j++) {
+          if (r.m[j >>> 5] >>> (j & 31) & 1) xorInto(r.d, frames[gen.base + j]);
+        }
+        setKnown(gen.base + c, r.d);
+      }
+      gen.piv.fill(null);
+      gen.rank = 0;
+    };
+    return {
+      frames,
+      known: () => known,
+      info: () => { let r = known; for (const g of gens) r += g.rank; return r; },
+      addSource(idx, data) {
+        if (frames[idx] !== undefined) return false;
+        const gen = gens[genOf[idx]];
+        setKnown(idx, data);
+        stripKnown(gen, idx - gen.base, data);
+        solve(gen);
+        return true;
+      },
+      addRepair(ri, data) {
+        const g = ri % gens.length, gen = gens[g];
+        if (gen.known === gen.n) return false;
+        const m = repairMask(ri, g, gen.n), d = new Uint8Array(data);
+        for (let w = 0; w < m.length; w++) {
+          let x = m[w] | 0;
+          while (x) {
+            const b = 31 - Math.clz32(x & -x);
+            x &= x - 1;
+            const f = frames[gen.base + (w << 5) + b];
+            if (f !== undefined) { xorInto(d, f); m[w] &= ~(1 << b); }
+          }
+        }
+        if (!insert(gen, { m, d })) return false;
+        solve(gen);
+        return true;
+      }
+    };
+  }
+/*REC-END*/
 
   const fmtBytes = (n) => n >= 1048576 ? (n / 1048576).toFixed(1) + " MB" : n >= 1024 ? (n / 1024).toFixed(1) + " KB" : Math.round(n) + " B";
   const MAX_FRAMES = 50000;
@@ -235,7 +378,7 @@
   $("#tR").onclick = () => switchTab(false);
 
   // ---------- 設定 ----------
-  const DEFAULTS = { mode: "auto", fps: "8", size: "600", ec: "L", comp: "1", facing: "environment", maxrecv: "4" };
+  const DEFAULTS = { mode: "auto", fps: "8", size: "600", ec: "L", comp: "1", facing: "environment", maxrecv: "4", save: "1" };
   function loadSettings() {
     let saved = {};
     try { saved = JSON.parse(localStorage.getItem("qrt-settings") || "{}") || {}; } catch (e) {}
@@ -259,7 +402,7 @@
     if (!auto) $("#rec").textContent = "手動設定を使用中です";
     else if (!sendFile) $("#rec").textContent = "ファイルを選ぶと、端末とファイルに合わせたおすすめ設定を自動で選びます";
   }
-  $("#mode").onchange = () => { saveSettings(); updateModeNote(); refreshSenderPlan(); };
+  $("#mode").onchange = () => { chunkOverride = null; saveSettings(); updateModeNote(); refreshSenderPlan(); };
   $("#fps").oninput = (e) => {
     $("#fpsV").textContent = e.target.value;
     saveSettings();
@@ -268,12 +411,12 @@
       updateSpeedLine();
     }
   };
-  $("#size").onchange = () => { saveSettings(); refreshSenderPlan(); };
+  $("#size").onchange = () => { chunkOverride = null; saveSettings(); refreshSenderPlan(); };
   $("#ec").onchange = () => { saveSettings(); refreshSenderPlan(); };
   $("#comp").onchange = async () => {
     saveSettings();
     if (!sendFile) return;
-    const c = await compressIfNeeded(sendFile.raw);
+    const c = await compressIfNeeded(sendFile.raw, sendFile.cname);
     sendFile.body = c.body;
     sendFile.c = c.c;
     rebuildHead();
@@ -281,9 +424,14 @@
   };
   $("#facing").onchange = saveSettings;
   $("#maxrecv").onchange = saveSettings;
+  $("#save").onchange = () => {
+    saveSettings();
+    if ($("#save").value !== "1") { persistOn = false; persistClear(); $("#rSave").textContent = ""; }
+  };
   $("#sreset").onclick = () => {
     for (const k in DEFAULTS) $("#" + k).value = DEFAULTS[k];
     $("#fpsV").textContent = DEFAULTS.fps;
+    chunkOverride = null;
     saveSettings();
     updateModeNote();
     refreshSenderPlan();
@@ -299,10 +447,9 @@
   let totalFrames = 0;
   let chunkSize = 600;
   let ecLevel = "L";
-  let playOrder = [];      // 表示する枠番号のリスト(再送時は絞る)
-  let playPos = 0;
-  let cycles = 0;
-  let aborted = false;
+  let seqPos = 0;          // 次に表示する通し番号(0〜K-1=元データ、K以降=復元用)
+  let numGens = 1;
+  let chunkOverride = null; // 受信側の提案で変更したデータ量
   let generation = 0;
   let sendAuto = true;
   let fpsTarget = 8;       // 自動調整の上限(ユーザー設定 or 状況コード)
@@ -314,14 +461,14 @@
   let qrDropCount = 0;
   let statLastT = 0;
   let autoLastT = 0;
-  let pauseRendering = false;
   let fbFpsApplied = false;
   let fbNote = "";
   const qrCache = new Map();
   const qrInFlight = new Set();
   const tmpCanvas = document.createElement("canvas");
   let sendWorker = null;
-  let manifestShownCycle = -1; // マニフェストQRを表示済みの周回
+  let manifestShownAt = -1;  // マニフェストを表示済みの通し番号
+  let manifestEvery = 120;   // マニフェストを再表示する間隔(枚)
   let manifestFrame = "";  // "QM|sid|b64" (複数ファイル時のみ)
   let stagedFiles = [];    // 転送前確認用
 
@@ -336,20 +483,28 @@
   }
   const makeFrame = (idx) => ["Q1", sid, idx, totalFrames, b64enc(slicePayload(idx * chunkSize, Math.min((idx + 1) * chunkSize, payloadLen())))].join("|");
 
+  const payloadFull = () => sendFile.full || (sendFile.full = concatBytes([sendFile.head, sendFile.body]));
+  const makeRepairFrame = (ri) => ["Q2", sid, totalFrames, ri, payloadLen(), b64enc(buildRepair(payloadFull(), chunkSize, totalFrames, ri))].join("|");
+  const idAt = (p) => p < totalFrames ? p : "r" + (p - totalFrames);
+  const textFor = (id) => typeof id === "number" ? makeFrame(id) : makeRepairFrame(+id.slice(1));
+
   function rebuildHead() {
+    sendFile.full = null;
     const name = sanitizeName($("#fname").value);
     sendFile.head = new TextEncoder().encode(JSON.stringify({
       n: name,
       s: sendFile.raw.length,
       c: sendFile.c,
       k: sendFile.k,
-      x: sendFile.x
+      x: sendFile.x || undefined // SHA-256を計算できない環境ではCRC32のみで照合する
     }) + "\n");
   }
 
-  async function compressIfNeeded(bytes) {
+  // すでに圧縮済みの形式は、圧縮を試さず(時間を節約して)そのまま送る
+  const PRECOMPRESSED = /\.(zip|gz|bz2|xz|7z|rar|jpe?g|png|webp|gif|avif|heic|mp4|m4v|mov|webm|mkv|mp3|aac|m4a|ogg|opus|docx|xlsx|pptx|epub|jar|apk)$/i;
+  async function compressIfNeeded(bytes, name) {
     let out = bytes, c = 0;
-    if ($("#comp").value === "1" && window.CompressionStream) {
+    if ($("#comp").value === "1" && window.CompressionStream && !PRECOMPRESSED.test(name || "")) {
       try {
         const z = await compressBytes(bytes, CompressionStream, "deflate-raw");
         if (z.length < bytes.length) { out = z; c = 1; }
@@ -444,7 +599,7 @@
       setStatus("#sSt", "err", "送信できません", "ファイルが大きすぎます(上限16MB)");
       return;
     }
-    const c = await compressIfNeeded(raw);
+    const c = await compressIfNeeded(raw, files.length === 1 ? name : "");
     $("#fname").value = name;
     $("#sNote").textContent = note || "複数選択すると、ZIPにまとめて送信します";
     sendFile = {
@@ -453,8 +608,11 @@
       c: c.c,
       k: crc32(raw),
       x: await sha256Hex(raw),
+      cname: files.length === 1 ? name : "",
+      full: null,
       head: null
     };
+    chunkOverride = null;
     rebuildHead();
     newSid();
     // マニフェスト枠(複数ファイル時のみ・新しいセッションIDで作り直す)
@@ -473,14 +631,19 @@
   }
 
   // --- おすすめ設定(自動モード) ---
-  function autoRecommend(payloadLen) {
+  // ファイルの大きさと端末の性能から、1枚あたりのデータ量・速度・誤り訂正を決める
+  function autoRecommend(plen) {
     const cores = navigator.hardwareConcurrency || 4;
     const mem = navigator.deviceMemory || 4;
     const mobile = /Android|iPhone|iPad|Mobi/i.test(navigator.userAgent || "");
+    const weak = cores <= 4 || mem <= 2;
     let fps = mobile ? 8 : 12;
-    if (cores <= 4 || mem <= 2) fps = Math.min(fps, 6);
-    const size = 600;
-    return { fps, size, ec: Math.ceil(payloadLen / size) <= 40 ? "M" : "L" };
+    if (weak) fps = Math.min(fps, 6);
+    let size = weak ? 400 : 600;            // 非力な端末は粗いQR(読み取りやすい)にする
+    if (!weak && Math.ceil(plen / size) > 300) size = 800; // 大きいファイルは枚数を抑える
+    const n = Math.max(1, Math.ceil(plen / size));
+    size = Math.min(1000, Math.max(3, Math.ceil(plen / n / 3) * 3)); // 各枠をほぼ同じ大きさに(3の倍数でbase64の余りを無くす)
+    return { fps, size, ec: n <= 40 ? "M" : "L" };
   }
 
   function refreshSenderPlan() {
@@ -490,14 +653,15 @@
     if (sendAuto) {
       const r = autoRecommend(payloadLen());
       size = r.size; ec = r.ec; fps = r.fps;
-      $("#rec").textContent = "おすすめ設定を自動選択しました: " + fps + "枚/秒 ・ " + size + "B ・ 誤り訂正" + ec + "(端末の性能に合わせて速度を自動調整します)";
+      $("#rec").textContent = "おすすめ設定を自動選択しました: " + fps + "枚/秒 ・ " + size + "B ・ 誤り訂正" + ec + "(端末とファイルに合わせて自動調整します)";
     } else {
       size = +$("#size").value;
       ec = $("#ec").value;
       fps = +$("#fps").value;
     }
+    if (chunkOverride) size = chunkOverride;
     const capOrder = [1000, 600, 400, 200];
-    while (Math.ceil(size / 3) * 4 + 20 > QR_CAP[ec] && size > 100) {
+    while (Math.ceil(size / 3) * 4 + 40 > QR_CAP[ec] && size > 100) {
       size = capOrder.find((v) => v < size) || 100;
       note = "誤り訂正が強いため、データ量を自動で " + size + "B に下げました";
     }
@@ -520,15 +684,14 @@
         return;
       }
     }
-    playOrder = [...Array(totalFrames).keys()];
-    playPos = 0;
-    cycles = 0;
+    seqPos = 0;
+    numGens = Math.ceil(totalFrames / GEN);
+    manifestEvery = Math.max(totalFrames, 120);
     generation++;
     qrCache.clear();
     qrInFlight.clear();
     qrCache.delete(-1);
-    aborted = false;
-    manifestShownCycle = -1;
+    manifestShownAt = -1;
     if (!fbFpsApplied) {
       fpsTarget = fps;
       fpsCurrent = fps;
@@ -547,18 +710,16 @@
 
   function prefetchQr() {
     if (!sendFile || !sendWorker) return;
-    const n = playOrder.length;
-    const want = Math.min(n, PREVIEW_QR);
-    for (let i = 0; i < want; i++) {
-      const id = playOrder[(playPos + i) % n];
+    for (let i = 0; i < PREVIEW_QR; i++) {
+      const id = idAt(seqPos + i);
       if (!qrCache.has(id) && !qrInFlight.has(id)) {
         qrInFlight.add(id);
-        sendWorker.post({ k: "qr", id, g: generation, text: makeFrame(id), ec: ecLevel });
+        sendWorker.post({ k: "qr", id, g: generation, text: textFor(id), ec: ecLevel });
       }
     }
     if (qrCache.size > CACHE_MAX) {
       const keep = new Set();
-      for (let i = 0; i < want; i++) keep.add(playOrder[(playPos + i) % n]);
+      for (let i = 0; i < PREVIEW_QR; i++) keep.add(idAt(seqPos + i));
       for (const k of [...qrCache.keys()]) {
         if (qrCache.size <= CACHE_MAX) break;
         if (!keep.has(k)) qrCache.delete(k);
@@ -613,13 +774,15 @@
     $("#sSpeed").textContent = fbNote || "";
   }
   function updateFrameInfo() {
-    const n = playOrder.length;
-    const cur = playOrder[(playPos - 1 + n) % n] + 1;
-    $("#sInfo").textContent = cur + " / " + totalFrames + " 枚目(合計 " + fmtBytes(payloadLen()) + ")";
+    const p = seqPos - 1;
+    const tail = "(合計 " + fmtBytes(payloadLen()) + ")";
+    if (p < totalFrames) $("#sInfo").textContent = Math.max(p + 1, 0) + " / " + totalFrames + " 枚目" + tail;
+    else $("#sInfo").textContent = "復元用 " + (p - totalFrames + 1) + " 枚目" + tail;
   }
   function senderShowStatus() {
     if (!sendFile) return;
-    setStatus("#sSt", "run", "送信中", "受信側のカメラをこの画面に向けて、そのままお待ちください");
+    if (seqPos >= totalFrames) setStatus("#sSt", "run", "送信中(復元用データ)", "元データを一巡しました。読み取れなかった分を補う復元用データを送り続けます。受信側が完了するまでお待ちください");
+    else setStatus("#sSt", "run", "送信中", "受信側のカメラをこの画面に向けて、そのままお待ちください");
   }
 
   function renderLoop(t) {
@@ -630,13 +793,12 @@
       if (dt > Math.max(40, frameMs * 2.5)) qrDropCount++;
     }
     rafLast = t;
-    if (!sendFile || !playOrder.length) return;
+    if (!sendFile) return;
     autoFps(t);
-    if (aborted && !pauseRendering) return;
     const need = Math.max(2, Math.round(1000 / fpsCurrent / frameMs));
-    if (!pauseRendering && ++rafSkip < need) return;
-    // マニフェスト枠: 各周回の先頭で数フレームだけ表示(1周に1回)
-    if (manifestFrame && playPos === 0 && cycles > manifestShownCycle && !pauseRendering) {
+    if (++rafSkip < need) return;
+    // マニフェスト枠: 一定間隔で約1秒だけ表示(複数ファイル時)
+    if (manifestFrame && seqPos % manifestEvery === 0 && manifestShownAt !== seqPos) {
       if (!qrCache.has(-1) && !qrInFlight.has(-1)) {
         qrInFlight.add(-1);
         sendWorker.post({ k: "qr", id: -1, g: generation, text: manifestFrame, ec: "L" });
@@ -644,30 +806,29 @@
       const mq = qrCache.get(-1);
       if (mq) {
         drawQr(mq);
+        rafSkip = 0;
         $("#sInfo").textContent = "ファイル一覧(マニフェスト)を表示中";
-        manifestTicks = (manifestTicks || 0) + 1;
-        if (manifestTicks >= 15) { // 15フレーム分(約0.25〜1秒)表示したら本編へ
+        manifestTicks++;
+        if (manifestTicks >= Math.max(3, Math.round(fpsCurrent))) {
           manifestTicks = 0;
-          manifestShownCycle = cycles;
+          manifestShownAt = seqPos;
         }
         return;
       }
     }
-    const qr = qrCache.get(playOrder[playPos]);
+    const id = idAt(seqPos);
+    const qr = qrCache.get(id);
     if (!qr) {
       qrGenPending++;
       rafSkip = need;
       prefetchQr();
       return;
     }
-    pauseRendering = false;
     rafSkip = 0;
     drawQr(qr);
-    playPos++;
-    if (playPos >= playOrder.length) {
-      playPos = 0;
-      cycles++;
-    }
+    qrCache.delete(id);
+    seqPos++;
+    if (seqPos === totalFrames) senderShowStatus();
     prefetchQr();
     updateFrameInfo();
   }
@@ -697,11 +858,11 @@
 
   function stopSender(keepFiles) {
     sendFile = null;
-    playOrder = [];
+    seqPos = 0;
     qrCache.clear();
     qrInFlight.clear();
     generation++;
-    aborted = false;
+    chunkOverride = null;
     manifestFrame = "";
     stagedFiles = keepFiles ? stagedFiles : [];
     if (!keepFiles) renderFileList();
@@ -741,6 +902,15 @@
     fbStream = null;
     $("#fbVid").classList.remove("show");
   }
+  let fbDec = null, fbBusy = false, fbId = 0;
+  function onFbDecoded(msg) {
+    const d = msg && msg.data;
+    if (!d || d.k !== "dec") return;
+    fbBusy = false;
+    if (d.data && fbStream && /^(FB[12]\||[a-z0-9]{1,8}[\s,]+\d)/i.test(d.data)) {
+      if (applyFbCode(d.data)) stopFbScan();
+    }
+  }
   async function startFbScan() {
     if (!sendFile) { $("#fbInfo").textContent = "先にファイルを選んで転送を開始してください"; return; }
     $("#fbInfo").textContent = "カメラを起動中…";
@@ -751,6 +921,8 @@
       $("#fbInfo").textContent = "カメラを使えません。カメラ許可を確認するか、手入力を使ってください";
       return;
     }
+    if (!fbDec) fbDec = makeWorkerWrapper(onFbDecoded);
+    fbBusy = false;
     const v = $("#fbVid");
     v.srcObject = fbStream;
     v.classList.add("show");
@@ -761,21 +933,16 @@
     const ctx = cv.getContext("2d", { willReadFrequently: true });
     const scan = () => {
       fbRaf = requestAnimationFrame(scan);
-      if (v.readyState < 2) return;
-      const my = ++scanId;
+      if (v.readyState < 2 || fbBusy) return;
       const vw = v.videoWidth, vh = v.videoHeight;
-      if (!vw) return;
+      if (!vw || ++scanId % 2) return; // 1回おきに解析(負荷軽減)
       const scale = Math.min(1, 640 / Math.max(vw, vh));
       const w = Math.round(vw * scale), h = Math.round(vh * scale);
       if (cv.width !== w || cv.height !== h) { cv.width = w; cv.height = h; }
       ctx.drawImage(v, 0, 0, w, h);
-      if (my % 2) return; // 1回おきに解析(負荷軽減)
-      let res = null;
-      try { res = window.jsQR && jsQR(ctx.getImageData(0, 0, w, h).data, w, h, { inversionAttempts: "dontInvert" }); } catch (e) {}
-      if (res && res.data) {
-        const applied = applyFbCode(res.data);
-        if (applied) { stopFbScan(); }
-      }
+      const img = ctx.getImageData(0, 0, w, h);
+      fbBusy = true;
+      fbDec.post({ k: "dec", id: ++fbId, w, h, buf: img.data.buffer }, [img.data.buffer]);
     };
     fbRaf = requestAnimationFrame(scan);
   }
@@ -783,28 +950,45 @@
   // 形式1: "FB1|sid|got|total|recfps"  形式2: "sid got[/total] [fps]"
   function applyFbCode(text) {
     if (!sendFile) { $("#fbInfo").textContent = "転送を開始してから反映できます"; return false; }
-    let sidIn, got, total, recfps;
-    if (text.startsWith("FB1|")) {
+    let sidIn, got, total, recfps, recChunk = 0;
+    if (text.startsWith("FB1|") || text.startsWith("FB2|")) {
       const p = text.split("|");
-      if (p.length !== 5) return false;
+      if (p.length !== (text[2] === "2" ? 6 : 5)) return false;
       sidIn = p[1]; got = +p[2]; total = +p[3]; recfps = +p[4];
+      if (p.length === 6) recChunk = +p[5];
     } else {
-      const m = text.match(/^([a-z0-9]{1,8})[\s,]+(\d+)(?:[\s,/]+(\d+))?(?:[\s,]+(\d+))?$/i);
+      const m = text.match(/^([a-z0-9]{1,8})[\s,]+(\d+)(?:[\s,/]+(\d+))?(?:[\s,]+(\d+))?(?:[\s,]+(\d+))?$/i);
       if (!m) { $("#fbInfo").textContent = "読み取ったコードを解釈できませんでした: " + text.slice(0, 40); return false; }
-      sidIn = m[1]; got = +m[2]; total = m[3] ? +m[3] : 0; recfps = m[4] ? +m[4] : 0;
+      sidIn = m[1]; got = +m[2]; total = m[3] ? +m[3] : 0; recfps = m[4] ? +m[4] : 0; recChunk = m[5] ? +m[5] : 0;
     }
     if (sidIn !== sid) { $("#fbInfo").textContent = "別の転送の状況コードです(コード: " + sidIn + ")。現在のセッションは " + sid + " です"; return false; }
     let msg = "";
-    if (total && got) msg += "受信 " + got + "/" + total + "枚(" + Math.round(got / total * 100) + "%) ・ ";
+    if (total && got) msg += "受信 " + got + "/" + total + "枚相当(" + Math.round(got / total * 100) + "%) ・ ";
+    let changed = false;
     if (recfps >= 1 && recfps <= 20) {
       fpsTarget = Math.min(recfps, 20);
       fpsCurrent = Math.max(2, Math.round(fpsTarget));
       fbFpsApplied = true;
       fbNote = "相手の状況コードから速度を" + fpsCurrent + "枚/秒に調整しました";
       msg += "表示速度を " + fpsCurrent + "枚/秒 に変更しました";
-    } else {
-      msg += "速度の提案はありませんでした";
+      changed = true;
     }
+    // データ量の変更は新しい転送(別ID)としてやり直しになるため、序盤(50%未満)のときだけ反映する
+    if (recChunk >= 100 && recChunk < chunkSize) {
+      if (!total || got / total < 0.5) {
+        chunkOverride = Math.min(1000, recChunk);
+        rebuildHead();
+        newSid();
+        if (manifestFrame) manifestFrame = "QM|" + sid + "|" + manifestFrame.split("|")[2];
+        refreshSenderPlan();
+        msg += (changed ? " ・ " : "") + "1枚あたりのデータ量を " + chunkSize + "B に変更し、最初から送り直します(転送ID: " + sid + ")";
+        fbNote = "相手の読み取り状況に合わせて、データ量を" + chunkSize + "Bに変更しました";
+      } else {
+        msg += (changed ? " ・ " : "") + "受信が半分以上進んでいるため、データ量は変更しませんでした";
+      }
+      changed = true;
+    }
+    if (!changed) msg += "速度・データ量の提案はありませんでした";
     $("#fbInfo").textContent = msg;
     updateSpeedLine();
     return true;
@@ -838,6 +1022,13 @@
   let fbWorker = null;
   let manifestInfo = null;
   let manifestPending = null;
+  let rcv = null;           // 復元エンジン(makeRecovery)
+  let chunkC = 0;           // 1枠の大きさ(復元用枠から判明)
+  let payloadL = 0;         // 送信データ全体の長さ(復元用枠から判明)
+  let recvLog = [];         // 新しい情報になった枠の文字列(途中保存・再開用)
+  let logFlushed = 0;
+  let persistOn = false;
+  let foreignKey = "", foreignRun = 0, lastOwnT = 0;
   const blobUrls = [];
   // ① スライディングウィンドウ(直近15秒)のサンプル
   const winSamples = [];
@@ -857,6 +1048,8 @@
   let totalCount = 0;
 
   function recvAbort(msg) {
+    persistOn = false;
+    persistClear();
     recvAborted = true;
     stopCamera();
     setStatus("#rSt", "err", "中断しました", "");
@@ -865,6 +1058,18 @@
 
   function resetRecv(keepErr) {
     frames = null;
+    rcv = null;
+    chunkC = 0;
+    payloadL = 0;
+    recvLog = [];
+    logFlushed = 0;
+    persistOn = false;
+    foreignKey = "";
+    foreignRun = 0;
+    if (pTimer) { clearTimeout(pTimer); pTimer = 0; }
+    diagReset();
+    $("#rDiag").classList.add("hide");
+    $("#rSave").textContent = "";
     recvSid = "";
     totalCount = 0;
     gotCount = 0;
@@ -950,6 +1155,7 @@
     setWakeLock(true);
     recvStatusLine();
     if (!camRaf) camRaf = requestAnimationFrame(camLoop);
+    if (!diagTimer) diagTimer = setInterval(runDiag, 2000);
   }
 
   function stopCamera() {
@@ -959,10 +1165,12 @@
     recvStream = null;
     track = null;
     camToWorker = false;
+    if (diagTimer) { clearInterval(diagTimer); diagTimer = 0; }
+    $("#rDiag").classList.add("hide");
     $("#cam").textContent = "カメラを開始";
     $("#torch").classList.add("hide");
     $("#zoom").classList.add("hide");
-    if (!sendFile || aborted) setWakeLock(false);
+    if (!sendFile) setWakeLock(false);
     recvStatusLine();
   }
 
@@ -985,19 +1193,34 @@
     }
     workCtx.drawImage(v, 0, 0, w, h);
     const img = workCtx.getImageData(0, 0, w, h);
+    {
+      const px = img.data;
+      let s = 0, n = 0;
+      for (let i = 1; i < px.length; i += 1024) { s += px[i]; n++; }
+      if (n) diagBright = diagBright ? diagBright * 0.7 + s / n * 0.3 : s / n;
+    }
+    diagPostT = performance.now();
     camToWorker = true;
     decWorker.post({ k: "dec", id: ++decId, w, h, buf: img.data.buffer }, [img.data.buffer]);
   }
   let workCanvas = null, workCtx = null, decId = 0;
 
   function onDecoded(msg) {
-    const d = msg.data;
-    if (d.k !== "dec") return;
+    const d = msg && msg.data;
+    if (!d || d.k !== "dec") return;
     camToWorker = false;
+    const now = performance.now();
+    const isQ = !!d.data && /^(Q1|Q2|QM)\|/.test(d.data);
+    diagEv.push({ t: now, ms: now - diagPostT, k: d.data ? (isQ ? "ok" : "o") : "n" });
+    if (diagEv.length > 600) diagEv.shift();
     if (d.data && d.data.startsWith("Q1|")) {
       decodeFails = 0;
       $("#hint").textContent = "";
-      handleDataFrame(d.data);
+      handleDataFrame(d.data, false);
+    } else if (d.data && d.data.startsWith("Q2|")) {
+      decodeFails = 0;
+      $("#hint").textContent = "";
+      handleRepairFrame(d.data, false);
     } else if (d.data && d.data.startsWith("QM|")) {
       handleManifestFrame(d.data);
     } else if (++decodeFails === 40 && recvStream && !recvAborted) {
@@ -1016,18 +1239,24 @@
     const now = performance.now();
     winSamples.push({ t: now, b: gotBytes });
     while (winSamples.length > 2 && now - winSamples[0].t > WIN_MS) winSamples.shift();
-    const miss = totalCount - gotCount;
+    const miss = Math.max(0, totalCount - gotCount);
     $("#cGot").textContent = gotCount;
     $("#cMiss").textContent = miss;
     $("#cAll").textContent = totalCount;
     $("#pb").style.width = gotCount / totalCount * 100 + "%";
-    // 未取得の番号
-    const missing = [];
-    for (let i = 0; i < totalCount && missing.length < 5000; i++) {
-      if (frames[i] === undefined) missing.push(i);
+    // 未取得の表示(復元用データが届いたあとは番号ではなく「あと何枚分」)
+    if (!miss) {
+      $("#rMiss").textContent = "";
+    } else if (!payloadL) {
+      const missing = [];
+      for (let i = 0; i < totalCount && missing.length < 5000; i++) {
+        if (frames[i] === undefined) missing.push(i);
+      }
+      const missTxt = rangesToText(missing).join(", ");
+      $("#rMiss").textContent = "未取得 " + miss + "枚: " + (missTxt.length > 240 ? missTxt.slice(0, 240) + "…" : missTxt);
+    } else {
+      $("#rMiss").textContent = "復元用データで補っています(あと約" + miss + "枚分の読み取りで完了)";
     }
-    const missTxt = rangesToText(missing).join(", ");
-    $("#rMiss").textContent = miss ? "未取得 " + miss + "枚: " + (missTxt.length > 240 ? missTxt.slice(0, 240) + "…" : missTxt) : "";
     $("#rInfo").textContent = gotCount + " / " + totalCount + " 枚 受信" + (dupCount ? "(重複 " + dupCount + " 回は無視)" : "");
     // 速度(直近15秒のウィンドウ)・残り時間・進捗率
     if (winSamples.length >= 2) {
@@ -1047,25 +1276,34 @@
     updateFbQr();
   }
 
-  // --- データ枠(Q1)の処理 ---
-  function handleDataFrame(text) {
-    if (recvAborted || text.length > 1500) return;
-    const parts = text.split("|");
-    if (parts.length !== 5) return;
-    const s = parts[1];
-    const idx = +parts[2];
-    const total = +parts[3];
-    const b64 = parts[4];
-    if (!/^[a-z0-9]{1,8}$/.test(s) || !Number.isInteger(idx) || !Number.isInteger(total) || total < 1 || total > MAX_FRAMES || idx < 0 || idx >= total || !/^[A-Za-z0-9+/]*={0,2}$/.test(b64)) return;
+  // --- 受信セッションの管理 ---
+  const safeB64 = (s) => { try { return b64dec(s); } catch (e) { return null; } };
+  function ensureSession(s, total, replay) {
+    const now = performance.now();
+    let note = "";
     if (frames && gotCount > 0 && (s !== recvSid || total !== totalCount)) {
-      $("#rErr").textContent = "別の転送のQRを検出したため無視しました。最初からやり直す場合は「最初からやり直す」を押してください。";
-      return;
+      const key = s + "/" + total;
+      foreignRun = key === foreignKey ? foreignRun + 1 : 1;
+      foreignKey = key;
+      // 送信側が設定を変えて送り直した場合: 序盤なら自動で新しい転送へ切り替える
+      if (!replay && foreignRun >= 12 && now - lastOwnT > 3000 && gotCount / totalCount < 0.5) {
+        persistClear();
+        resetRecv(false);
+        note = "送信側が設定を変更したため、新しい転送(" + s + ")に切り替えました。";
+      } else {
+        $("#rErr").textContent = "別の転送のQRを検出したため無視しました。最初からやり直す場合は「最初からやり直す」を押してください。";
+        return false;
+      }
     }
     if (s !== recvSid || total !== totalCount) {
-      resetRecv(true);
+      if (frames) resetRecv(true);
       recvSid = s;
       totalCount = total;
-      frames = new Array(total);
+      rcv = makeRecovery(total, (i) => {
+        const cell = $("#grid").children[i];
+        if (cell) cell.className = "ok";
+      });
+      frames = rcv.frames;
       if (total <= 2000) {
         const grid = $("#grid");
         for (let i = 0; i < total; i++) {
@@ -1074,30 +1312,89 @@
           grid.appendChild(b);
         }
       }
-      // 待機していたマニフェストを表示
+      $("#rResume").classList.add("hide");
       if (manifestPending && manifestPending.sid === s) {
         showManifest(manifestPending.info);
         manifestPending = null;
       }
+      if (!replay) persistBegin(s, total);
     }
+    if (note) $("#hint").textContent = note;
+    lastOwnT = now;
+    foreignRun = 0;
+    foreignKey = "";
+    return true;
+  }
+  function overLimit(total, size) {
+    const limit = recvLimit();
+    maxChunkSeen = Math.max(maxChunkSeen, size);
+    if (total * maxChunkSeen > limit * 1.05 + 4096 || gotBytes + size > limit + 4096) {
+      recvAbort("受信サイズの上限(" + fmtBytes(limit) + ")を超えるため中断しました。設定で上限を変更できます。");
+      return true;
+    }
+    return false;
+  }
+  function afterChange() {
+    gotCount = rcv.info();
+    pushStat();
+    if (rcv.known() === totalCount) finishRecv();
+    else schedulePersist();
+  }
+
+  // --- データ枠(Q1)の処理 ---
+  function handleDataFrame(text, replay) {
+    if (recvAborted || text.length > 1600) return;
+    const parts = text.split("|");
+    if (parts.length !== 5) return;
+    const s = parts[1];
+    const idx = +parts[2];
+    const total = +parts[3];
+    const b64 = parts[4];
+    if (!/^[a-z0-9]{1,8}$/.test(s) || !Number.isInteger(idx) || !Number.isInteger(total) || total < 1 || total > MAX_FRAMES || idx < 0 || idx >= total || !/^[A-Za-z0-9+/]*={0,2}$/.test(b64)) return;
+    if (!ensureSession(s, total, replay)) return;
+    if (!replay) noteSeq("q", idx);
     if (frames[idx] !== undefined) {
       dupCount++;
       pushStat();
       return;
     }
-    const size = Math.floor(b64.length * 3 / 4);
-    const limit = recvLimit();
-    maxChunkSeen = Math.max(maxChunkSeen, size);
-    if (total * maxChunkSeen > limit * 1.05 + 4096 || gotBytes + size > limit + 4096) {
-      return recvAbort("受信サイズの上限(" + fmtBytes(limit) + ")を超えるため中断しました。設定で上限を変更できます。");
+    const data = safeB64(b64);
+    if (!data || !data.length || chunkC && data.length > chunkC) return;
+    if (overLimit(total, data.length)) return;
+    rcv.addSource(idx, data);
+    gotBytes += data.length;
+    recvLog.push(text);
+    afterChange();
+  }
+
+  // --- 復元用枠(Q2)の処理: 取りこぼした元データを方程式として取り込む ---
+  function handleRepairFrame(text, replay) {
+    if (recvAborted || text.length > 1600) return;
+    const p = text.split("|");
+    if (p.length !== 6) return;
+    const s = p[1];
+    const total = +p[2];
+    const ri = +p[3];
+    const L = +p[4];
+    if (!/^[a-z0-9]{1,8}$/.test(s) || !Number.isInteger(total) || total < 1 || total > MAX_FRAMES || !Number.isInteger(ri) || ri < 0 || ri > 1e9 || !Number.isInteger(L) || L < 1 || L > MAX_TOTAL + 4096 || !/^[A-Za-z0-9+/]*={0,2}$/.test(p[5])) return;
+    const data = safeB64(p[5]);
+    if (!data || !data.length) return;
+    const C = data.length;
+    if (L > total * C || L <= (total - 1) * C) return;
+    if (!ensureSession(s, total, replay)) return;
+    if (chunkC && chunkC !== C || payloadL && payloadL !== L || maxChunkSeen > C) return;
+    if (!replay) noteSeq("r", ri);
+    if (overLimit(total, C)) return;
+    chunkC = C;
+    payloadL = L;
+    if (!rcv.addRepair(ri, data)) {
+      dupCount++;
+      pushStat();
+      return;
     }
-    frames[idx] = b64dec(b64);
-    gotCount++;
-    gotBytes += size;
-    const cell = $("#grid").children[idx];
-    if (cell) cell.className = "ok";
-    pushStat();
-    if (gotCount === totalCount) finishRecv();
+    gotBytes += C;
+    recvLog.push(text);
+    afterChange();
   }
 
   // --- ③ マニフェスト枠(QM)の処理 ---
@@ -1143,32 +1440,36 @@
   // --- ② 受信側: 状況コードQRの表示 ---
   function updateFbQr() {
     if (!frames || recvAborted) return;
-    const miss = totalCount - gotCount;
-    // 読み取り実績(直近15秒)からおすすめの表示速度を提案
-    let rec = 0;
-    if (winSamples.length >= 2) {
+    // 推奨速度: 診断結果があればそれを、なければ直近15秒の読み取り実績から推定
+    let rf = 0;
+    if (diagRec && diagRec.fps) {
+      rf = diagRec.fps;
+    } else if (winSamples.length >= 2) {
       const now = performance.now();
       const first = winSamples[0];
       const secs = (now - first.t) / 1000;
       if (secs > 0.5 && gotCount > 1) {
-        // ウィンドウ内の取得枚数を大まかに推定(サイズ比から)
         const bytes = gotBytes - first.b;
-        const per = maxChunkSeen || 1;
-        rec = Math.min(20, Math.max(1, Math.round(bytes / secs / per)));
+        rf = Math.min(20, Math.max(1, Math.round(bytes / secs / (maxChunkSeen || 1))));
       }
     }
     const pct = totalCount ? Math.round(gotCount / totalCount * 100) : 0;
-    const text = "FB1|" + recvSid + "|" + gotCount + "|" + totalCount + "|" + rec;
-    $("#fbCodeTxt").textContent = recvSid + " ・ " + pct + "%" + (rec ? " ・ 推奨" + rec + "枚/秒" : "");
+    const rc = diagRec && diagRec.chunk && pct < 50 ? diagRec.chunk : 0;
+    const text = "FB2|" + recvSid + "|" + gotCount + "|" + totalCount + "|" + rf + "|" + rc;
+    $("#fbCodeTxt").textContent = [recvSid, gotCount, totalCount, rf, rc].join(" ") + "(" + pct + "%)";
     $("#fbSend").classList.remove("hide");
     if (!fbWorker) {
       fbWorker = makeWorkerWrapper((msg) => {
-        const d = msg.data;
-        if (d.k === "qr" && d.id === "fb" && !d.err) drawFbQr(d);
+        const d = msg && msg.data;
+        if (d && d.k === "qr" && d.id === "fb" && !d.err) drawFbQr(d);
       });
     }
-    fbWorker.post({ k: "qr", id: "fb", text, ec: "L" });
+    if (text !== fbLastText) {
+      fbLastText = text;
+      fbWorker.post({ k: "qr", id: "fb", text, ec: "L" });
+    }
   }
+  let fbLastText = "";
   function drawFbQr(qr) {
     const cv = $("#fbQr");
     const m = qr.n, q = 2;
@@ -1197,6 +1498,8 @@
     const secs = Math.max((performance.now() - startT) / 1000, 0.001);
     const got = frames;
     frames = null;
+    rcv = null;
+    persistOn = false;
     $("#cGot").textContent = totalCount;
     $("#cMiss").textContent = 0;
     $("#pb").style.width = "100%";
@@ -1204,7 +1507,11 @@
     $("#rSpeed").textContent = "受信完了: " + fmtBytes(gotBytes) + " を " + secs.toFixed(1) + "秒で受信(平均 " + fmtBytes(gotBytes / secs) + "/秒)";
     setStatus("#rSt", "warn", "検証中…", "サイズ・CRC32・SHA-256を確認しています");
     try {
-      const all = concatBytes(got);
+      let all = concatBytes(got);
+      if (payloadL) {
+        if (all.length < payloadL) throw new Error("受信データの長さが足りません");
+        all = all.subarray(0, payloadL); // 復元した最後の枠の詰め物を取り除く
+      }
       const nl = all.indexOf(10);
       if (nl < 2 || nl > 2048) throw new Error("ヘッダーが不正です");
       const head = JSON.parse(new TextDecoder().decode(all.subarray(0, nl)));
@@ -1277,7 +1584,10 @@
         $("#rOut").prepend(media);
       }
       $("#fbSend").classList.add("hide");
+      $("#rDiag").classList.add("hide");
+      persistClear();
     } catch (e) {
+      persistClear();
       setStatus("#rSt", "err", "受信に失敗しました", "");
       $("#rErr").textContent = "復元に失敗: " + e.message + "。「最初からやり直す」でもう一度お試しください。";
     }
@@ -1298,19 +1608,250 @@
     if (track) track.applyConstraints({ advanced: [{ zoom: +e.target.value }] }).catch(() => {});
   };
   $("#rrestart").onclick = () => {
+    persistClear();
     resetRecv();
     if (recvStream) recvStatusLine();
     else startCamera();
   };
   $("#rabort").onclick = () => {
+    persistClear();
     stopCamera();
     resetRecv();
     recvStatusLine();
   };
 
+  // ============================================================
+  // ④ 読み取り品質の自動診断(受信側)
+  // ============================================================
+  const diagEv = [];   // {t, ms, k}  k: ok=当方式のQR / o=他のQR / n=読み取れず
+  const diagSeq = [];  // {t, ty, n}  送信側の通し番号の観測(送信速度・取りこぼしの推定用)
+  let diagTimer = 0, diagRec = null, diagBright = 0, diagPostT = 0;
+  function diagReset() {
+    diagEv.length = 0;
+    diagSeq.length = 0;
+    diagRec = null;
+    diagBright = 0;
+  }
+  function noteSeq(ty, n) {
+    const last = diagSeq[diagSeq.length - 1];
+    if (last && last.ty === ty && last.n === n) return; // 同じ枠を続けて読んだ分は数えない
+    diagSeq.push({ t: performance.now(), ty, n });
+    if (diagSeq.length > 400) diagSeq.shift();
+  }
+  function runDiag() {
+    const box = $("#rDiag");
+    if (!recvStream || !frames || recvAborted) { box.classList.add("hide"); diagRec = null; return; }
+    const now = performance.now();
+    while (diagEv.length && now - diagEv[0].t > 8000) diagEv.shift();
+    while (diagSeq.length && now - diagSeq[0].t > 8000) diagSeq.shift();
+    if (diagEv.length < 12) return;
+    const span = Math.max(1, (now - diagEv[0].t) / 1000);
+    let ok = 0, nul = 0, sumMs = 0;
+    for (const e of diagEv) {
+      if (e.k === "ok") ok++;
+      else if (e.k === "n") nul++;
+      sumMs += e.ms;
+    }
+    const A = diagEv.length;
+    const avgMs = sumMs / A;
+    const aimed = ok >= 3;
+    // 送信側の表示速度と、こちらの取りこぼし率を通し番号の進みから推定
+    let pairs = 0, sumD = 0, sumDt = 0;
+    for (let i = 1; i < diagSeq.length; i++) {
+      const p = diagSeq[i - 1], q = diagSeq[i], d = q.n - p.n;
+      if (p.ty === q.ty && d >= 1 && d <= 40) { pairs++; sumD += d; sumDt += (q.t - p.t) / 1000; }
+    }
+    const fSend = pairs >= 4 && sumDt > 0 ? sumD / sumDt : 0;
+    const skip = pairs >= 4 ? Math.max(0, 1 - pairs / sumD) : 0;
+    const fcur = Math.round(fSend);
+    const rec = { fps: 0, chunk: 0 };
+    const notes = [];
+    const pct = totalCount ? gotCount / totalCount * 100 : 0;
+    if (!aimed) {
+      if (A >= 20 && ok === 0) notes.push("QRを検出できていません。送信側の画面全体がカメラに映るように向けてください。");
+    } else {
+      const failR = nul / A;
+      if (fcur) {
+        const delivered = fSend * (1 - skip);
+        if (skip > 0.15) {
+          rec.fps = Math.max(1, Math.min(20, Math.floor(delivered * 0.75)));
+          notes.push("取りこぼしが約" + Math.round(skip * 100) + "%あります。送信側の速度を約" + rec.fps + "枚/秒に下げると改善します(状況コードで自動調整できます)。");
+        } else if (skip < 0.05 && fcur < 20 && avgMs * fSend < 300 && failR < 0.3) {
+          rec.fps = Math.min(20, Math.ceil(fcur * 1.3));
+          notes.push("読み取りに余裕があります。送信側を約" + rec.fps + "枚/秒に上げると早く終わります。");
+        } else {
+          rec.fps = fcur;
+        }
+      }
+      if (avgMs > 120) notes.push("端末の処理が遅めです(1回 約" + Math.round(avgMs) + "ms)。他のアプリやタブを閉じると改善します。");
+      if (failR > 0.5 && avgMs < 400) {
+        const cs = chunkC || maxChunkSeen;
+        const smaller = [1000, 600, 400, 200].find((v) => v < cs - 20);
+        if (smaller && pct < 50) {
+          rec.chunk = smaller;
+          notes.push("QRの読み取り失敗が多めです(約" + Math.round(failR * 100) + "%)。1枚あたりのデータ量を" + smaller + "Bに減らすとQRが粗くなり読みやすくなります。");
+        } else {
+          notes.push("QRの読み取り失敗が多めです(約" + Math.round(failR * 100) + "%)。距離・角度・ピントを調整してください。");
+        }
+        if (zoomRange && +$("#zoom").value <= zoomRange.min + 0.01) notes.push("ズームのスライダーで、QRを画面いっぱいに映してみてください。");
+      }
+    }
+    if (diagBright && diagBright < 70) notes.push("映像が暗めです。送信側の画面の明るさを上げるか、ライトを使ってください。");
+    else if (diagBright > 235) notes.push("映像が明るすぎます。反射や白飛びがないか確認してください。");
+    diagRec = rec.fps || rec.chunk ? rec : null;
+    $("#rDiagM").textContent = "検出成功 " + Math.round(ok / A * 100) + "% ・ 処理 " + Math.round(avgMs) + "ms/回 ・ 解析 " + (A / span).toFixed(1) + "回/秒" + (fcur ? " ・ 送信 約" + fcur + "枚/秒 ・ 取りこぼし " + Math.round(skip * 100) + "%" : "");
+    const sBox = $("#rDiagS");
+    sBox.innerHTML = "";
+    if (!notes.length && aimed) notes.push("✓ 良好です。調整は不要です。");
+    for (const n of notes.slice(0, 3)) {
+      const div = document.createElement("div");
+      div.textContent = n;
+      sBox.appendChild(div);
+    }
+    box.classList.remove("hide");
+    updateFbQr();
+  }
+
+  // ============================================================
+  // ③ 受信の途中保存と再開(IndexedDB。端末内にだけ保存し、外部へは送信しません)
+  // ============================================================
+  let idbP = null, pchain = Promise.resolve(), pTimer = 0;
+  const idb = () => idbP || (idbP = new Promise((res) => {
+    try {
+      const rq = indexedDB.open("qrt-recv", 1);
+      rq.onupgradeneeded = () => {
+        rq.result.createObjectStore("meta");
+        rq.result.createObjectStore("log", { keyPath: "i" });
+      };
+      rq.onsuccess = () => res(rq.result);
+      rq.onerror = rq.onblocked = () => res(null);
+    } catch (e) { res(null); }
+  }));
+  const txDone = (tx) => new Promise((res, rej) => {
+    tx.oncomplete = () => res(true);
+    tx.onerror = tx.onabort = () => rej(tx.error);
+  });
+  const pq = (fn) => (pchain = pchain.then(fn).catch(() => {}));
+  function persistClear() {
+    if (pTimer) { clearTimeout(pTimer); pTimer = 0; }
+    return pq(async () => {
+      const db = await idb();
+      if (!db) return;
+      const tx = db.transaction(["meta", "log"], "readwrite");
+      tx.objectStore("meta").clear();
+      tx.objectStore("log").clear();
+      await txDone(tx);
+    });
+  }
+  function persistBegin(sidv, total) {
+    persistOn = false;
+    logFlushed = 0;
+    if ($("#save").value !== "1") return;
+    persistOn = true;
+    pq(async () => {
+      const db = await idb();
+      if (!db) { persistOn = false; return; }
+      try { // 空き容量が足りなければ保存しない
+        const e = await navigator.storage.estimate();
+        if (e && e.quota && e.quota - (e.usage || 0) < total * 1400 + 4e6) {
+          persistOn = false;
+          $("#rSave").textContent = "端末の空き容量が少ないため、途中保存は行いません。";
+          return;
+        }
+      } catch (e) {}
+      const tx = db.transaction(["meta", "log"], "readwrite");
+      tx.objectStore("meta").clear();
+      tx.objectStore("log").clear();
+      tx.objectStore("meta").put({ sid: sidv, total, n: 0, t: Date.now() }, "cur");
+      await txDone(tx);
+      $("#rSave").textContent = "途中経過は端末内に自動保存されます(タブを閉じても再開できます)。";
+      try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist(); } catch (e) {}
+    });
+  }
+  function schedulePersist() {
+    if (!persistOn || pTimer) return;
+    pTimer = setTimeout(() => { pTimer = 0; persistFlush(); }, 1500);
+  }
+  function persistFlush() {
+    if (!persistOn || recvLog.length <= logFlushed) return;
+    const from = logFlushed, items = recvLog.slice(from), to = recvLog.length, s = recvSid, t = totalCount;
+    logFlushed = to;
+    pq(async () => {
+      if (!persistOn) return;
+      const db = await idb();
+      if (!db) return;
+      try {
+        const tx = db.transaction(["meta", "log"], "readwrite");
+        const st = tx.objectStore("log");
+        items.forEach((x, k) => st.put({ i: from + k, t: x }));
+        tx.objectStore("meta").put({ sid: s, total: t, n: to, t: Date.now() }, "cur");
+        await txDone(tx);
+      } catch (e) {
+        persistOn = false;
+        $("#rSave").textContent = "端末への保存に失敗したため、途中保存を停止しました(容量不足の可能性があります)。";
+      }
+    });
+  }
+  window.addEventListener("pagehide", () => { if (pTimer) { clearTimeout(pTimer); pTimer = 0; } persistFlush(); });
+  document.addEventListener("visibilitychange", () => { if (document.hidden) { if (pTimer) { clearTimeout(pTimer); pTimer = 0; } persistFlush(); } });
+
+  async function persistPeek() {
+    try {
+      const db = await idb();
+      if (!db) return null;
+      return await new Promise((res) => {
+        const rq = db.transaction("meta").objectStore("meta").get("cur");
+        rq.onsuccess = () => res(rq.result || null);
+        rq.onerror = () => res(null);
+      });
+    } catch (e) { return null; }
+  }
+  async function persistLoadLog() {
+    const db = await idb();
+    if (!db) return [];
+    return await new Promise((res) => {
+      const rq = db.transaction("log").objectStore("log").getAll();
+      rq.onsuccess = () => res((rq.result || []).sort((x, y) => x.i - y.i).map((r) => r.t));
+      rq.onerror = () => res([]);
+    });
+  }
+  async function showResumeCard() {
+    if ($("#save").value !== "1") return;
+    const meta = await persistPeek();
+    if (!meta || !meta.n || Date.now() - meta.t > 864e5 || frames) return;
+    const mins = Math.max(1, Math.round((Date.now() - meta.t) / 60000));
+    $("#rResumeTx").textContent = "前回の受信(転送ID " + meta.sid + " ・ " + meta.total + "枚構成)の続きがあります。" + meta.n + "枚分を保存済み(" + (mins >= 60 ? Math.round(mins / 60) + "時間" : mins + "分") + "前)";
+    $("#rResume").classList.remove("hide");
+  }
+  $("#bresume").onclick = async () => {
+    $("#rResume").classList.add("hide");
+    const log = await persistLoadLog();
+    resetRecv();
+    for (const t of log) {
+      if (t.startsWith("Q1|")) handleDataFrame(t, true);
+      else if (t.startsWith("Q2|")) handleRepairFrame(t, true);
+      if (recvAborted) break;
+    }
+    if (!frames) { // 復元済み・または読めなかった場合
+      if (!recvAborted) $("#rErr").textContent = "保存データを読み込めませんでした。最初から受信してください。";
+      return;
+    }
+    persistOn = $("#save").value === "1";
+    logFlushed = recvLog.length;
+    $("#rSave").textContent = "保存した続きから再開しました。引き続き端末内に自動保存されます。";
+    gotCount = rcv.info();
+    updateStats();
+    startCamera();
+  };
+  $("#bdiscard").onclick = () => {
+    persistClear();
+    $("#rResume").classList.add("hide");
+  };
+
   // ---------- 起動 ----------
   loadSettings();
   recvStatusLine();
+  showResumeCard();
   if ("serviceWorker" in navigator) {
     navigator.serviceWorker.register("s-v2.js").catch(() => {});
   }

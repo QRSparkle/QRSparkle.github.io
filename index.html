@@ -58,6 +58,9 @@ input[type=text]{width:100%}
 #rFiles b{display:block;margin-bottom:2px}
 #rFiles div{display:flex;justify-content:space-between;gap:8px}
 #rFiles span{color:var(--mut);flex:none}
+#rResume{border-color:var(--ac);margin:0 0 14px}
+.rbox{border:1px solid var(--bd);border-radius:10px;padding:8px 12px;margin-top:10px;font-size:13px}
+.rbox b{display:block;margin-bottom:2px}.rbox #rDiagS div{margin-top:4px}
 #fbSend{display:flex;align-items:center;gap:12px;margin-top:10px;flex-wrap:wrap}
 #fbQr{width:96px;height:96px;image-rendering:pixelated;border:1px solid var(--bd);border-radius:8px;background:#fff;flex:none}
 </style>
@@ -87,6 +90,8 @@ input[type=text]{width:100%}
   <select id="facing"><option value="environment">背面カメラ</option><option value="user">前面カメラ</option></select>
   <label>受信データのサイズ上限(超える転送は中断します)</label>
   <select id="maxrecv"><option value="0.25">256 KB</option><option value="1">1 MB</option><option value="4">4 MB</option><option value="16">16 MB</option></select>
+  <label>受信の途中経過を端末内に自動保存する(タブを閉じても続きから再開できます)</label>
+  <select id="save"><option value="1">保存する(推奨)</option><option value="0">保存しない</option></select>
   <button class="btn ghost" id="sreset" type="button" style="margin-top:14px">初期値に戻す</button>
 </details>
 
@@ -111,7 +116,7 @@ input[type=text]{width:100%}
         <div class="note" style="margin-top:8px">受信側に表示される「状況コード」を、この端末のカメラで読み取るか手入力すると、表示速度や1枚あたりのデータ量を自動で調整します。カメラで読み取る場合は、受信側デバイスの状況コードをこの画面に向けてください。</div>
         <div class="row"><button class="btn ghost" id="bfbcam" type="button">📷 状況コードを読み取る</button></div>
         <video id="fbVid" playsinline muted></video>
-        <label>状況コードを手入力(例: k3f2 62)</label>
+        <label>状況コードを手入力(受信側に表示される文字列。例: k3f2 62 67 8 0)</label>
         <div class="row" style="margin-top:4px"><input type="text" id="fbCode" autocomplete="off" placeholder="例: k3f2 62"><button class="btn ghost" id="bfbin" type="button">反映</button></div>
         <div id="fbInfo" class="note" style="margin-top:8px"></div>
       </details>
@@ -121,6 +126,7 @@ input[type=text]{width:100%}
 
 <section id="pR" class="card hide">
   <div class="st" id="rSt" data-s="idle"><i></i><div><b>カメラ停止中</b><span>「カメラを開始」を押してください</span></div></div>
+  <div class="card hide" id="rResume"><div class="bold" id="rResumeTx"></div><div class="note" style="margin-top:4px">端末内に保存された受信データから、続きを受信できます。</div><div class="row"><button class="btn" id="bresume" type="button">続きから受信</button><button class="btn ghost" id="bdiscard" type="button">破棄</button></div></div>
   <div class="cols">
     <div class="vis">
       <video id="vid" playsinline muted></video>
@@ -132,8 +138,10 @@ input[type=text]{width:100%}
       <div class="cnt"><div><b id="cGot">0</b><span>取得済み</span></div><div><b id="cMiss">-</b><span>未取得</span></div><div><b id="cAll">-</b><span>全体</span></div></div>
       <div class="bar"><i id="pb"></i></div>
       <div id="rInfo" class="note"></div><div id="rSpeed" class="note"></div><div id="rMiss" class="note bold"></div>
+      <div id="rDiag" class="rbox hide"><b>📊 読み取り診断</b><div id="rDiagM" class="note"></div><div id="rDiagS"></div></div>
+      <div id="rSave" class="note" style="margin-top:6px"></div>
       <div id="rFiles" class="hide"></div>
-      <div id="fbSend" class="hide"><canvas id="fbQr" width="21" height="21"></canvas><div class="note">相手に見せる<br><b>状況コード: <span id="fbCodeTxt">-</span></b><br>送信側の「状況コードを読み取る」にこれをかざすと、速度が自動調整されます</div></div>
+      <div id="fbSend" class="hide"><canvas id="fbQr" width="21" height="21"></canvas><div class="note">相手に見せる<br><b>状況コード: <span id="fbCodeTxt">-</span></b><br>送信側の「状況コードを読み取る」にこれをかざすと、速度とデータ量が自動調整されます</div></div>
       <div class="grid" id="grid"></div>
       <div class="row"><button class="btn ghost" id="rrestart" type="button">最初からやり直す</button><button class="btn ghost" id="rabort" type="button">受信を中止</button></div>
       <div id="rErr" class="err" style="margin-top:8px"></div>

@@ -1,4 +1,4 @@
-const V = "qrt-v2-features-2";
+const V = "qrt-v3-erasure";
 const F = ["./", "index.html", "manifest.webmanifest", "icon-192.png", "icon-512.png", "app.js", "qrdecode.js", "w-c6f090074a.js"];
 self.addEventListener("install", (e) => {
   e.waitUntil(caches.open(V).then((c) => c.addAll(F)).then(() => self.skipWaiting()));
