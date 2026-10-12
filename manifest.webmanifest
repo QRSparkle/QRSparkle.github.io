@@ -1,0 +1,24 @@
+{
+ "name": "QR転送",
+ "short_name": "QR転送",
+ "description": "ファイルをQRで画面から画面へ。通信不要。",
+ "start_url": "./",
+ "scope": "./",
+ "display": "standalone",
+ "background_color": "#111317",
+ "theme_color": "#2563eb",
+ "icons": [
+  {
+   "src": "icon-192.png",
+   "sizes": "192x192",
+   "type": "image/png",
+   "purpose": "any maskable"
+  },
+  {
+   "src": "icon-512.png",
+   "sizes": "512x512",
+   "type": "image/png",
+   "purpose": "any maskable"
+  }
+ ]
+}
